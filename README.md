@@ -1,4 +1,4 @@
-```markdown
+
 # Rapid-Sampling
 
 Fast LLM sampling kernels (3-7x faster than FlashInfer!) implemented in CUDA.
