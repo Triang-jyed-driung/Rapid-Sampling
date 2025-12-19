@@ -1,7 +1,7 @@
 
 # Rapid-Sampling
 
-Fast LLM sampling kernels (3-7x faster than FlashInfer!) implemented in CUDA.
+Fast LLM sampling kernels (1.5-25x faster than FlashInfer!) implemented in CUDA.
 
 # Warning: Prototype Quality Code, DO NOT Use in Production!
 
@@ -154,19 +154,25 @@ Perform batched sampling with repetition and presence penalties.
 ## Technical Details
 ### Key Optimizations
 
-1. **Quaternary Search**: Fast threshold finding for top-k/top-p sampling, offering superior performance compared to binary search. The algorithm requires only 4-14 iterations to find the optimal threshold. While [FlashInfer uses ternary search](https://github.com/flashinfer-ai/flashinfer/blob/f6a9899d157522a2651c886cbfb68c6210e11918/include/flashinfer/sampling.cuh#L1711), our quaternary search approach further reduces global memory pressure and computational overhead.
+1. **Quaternary Search**: Fast threshold finding for top-k/top-p sampling, and than binary search. The algorithm requires only 4-14 iterations (reads) to find the optimal threshold. While [FlashInfer uses ternary search](https://github.com/flashinfer-ai/flashinfer/blob/f6a9899d157522a2651c886cbfb68c6210e11918/include/flashinfer/sampling.cuh#L1711), our quaternary search approach further reduces global memory pressure and computational overhead.
 
 2. **128-bit Vectorization**: The implementation leverages `float4` operations for vectorized memory loads and computations, achieving optimal memory bandwidth utilization. As a result, the vocabulary size `V` must be a multiple of 4 for proper alignment.
 
-3. **Monotonic Inclusive Scans**: Implements numerically stable cumulative probability calculations through monotonic inclusive scans. While the [FlashInfer blog on LLM Sampling](https://flashinfer.ai/2025/03/10/sampling.html) states that parallel prefix-sum cannot guarantee monotonic outputs due to floating-point arithmetic properties, I disagree with the statement:
+3. **Monotonic Inclusive Scans**: Implements numerically granted cumulative probability calculations through monotonic inclusive scans. While the [FlashInfer blog on LLM Sampling](https://flashinfer.ai/2025/03/10/sampling.html) states that parallel prefix-sum cannot guarantee monotonic outputs due to floating-point arithmetic properties:
+
+> Due to the non-associative and non-commutative nature of floating-point arithmetic, parallel prefix-sum cannot guarantee monotonic outputs even with non-negative inputs
+
+I disagree with the statement because:
    - Floating-point addition and multiplication **are** commutative, as guaranteed by IEEE 754 standards.
    - Although floating-point addition is not associative, this challenge can be addressed by avoiding generic libraries like CUB and implementing controlled accumulation patterns yourself.
 
-Within a single warp, the sequence `__shfl_up_sync 16 8 4 2 1` maintains monotonicity, whereas `1 2 4 8 16` does not. For blocks containing 1024 threads, we implement two approaches to guarantee monotonicity while maintaining efficiency:
-   - Method 1: Shared memory reduction with schedule `512 256 ... 8 4 2 1`
-   - Method 2: Warp-level accumulation followed by sequential processing of 32 values by the first thread
-   
-Both methods maintain monotonicity based on the principle that "the whole is greater than the part" and the monotonicity property of floating-point addition: if `a ≤ a'`, then `a + b ≤ a' + b`.
+Within a single warp, the sequence `__shfl_up_sync 16 8 4 2 1` maintains monotonicity, whereas `1 2 4 8 16` does not. For blocks containing 1024 threads, I know two approaches to guarantee monotonicity while maintaining efficiency:
+   - 1: Shared memory reduction with schedule `512 256 ... 8 4 2 1`
+   - 2: Warp-level accumulation `__shfl_up_sync 16 8 4 2 1`, followed by sequential addition of 32 values by the first thread 
+
+I implemented the second one in the code. The first approach has slightly better numerical stability, but heavier L1/shared memory burden. I am unsure which is faster.
+
+The monotonicity of both methods can be proved, based on the principle that "the whole is greater than the part," and the monotonicity property of floating-point addition: if `a ≤ a'`, then `a + b ≤ a' + b`.
 
 4. **L2 Cache Optimization**: Implements persistent L2 cache policies for improved memory access patterns:
    ```cpp
@@ -179,10 +185,10 @@ Both methods maintain monotonicity based on the principle that "the whole is gre
    cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
    ```
 
-5. **Two-Phase Selection Strategy**: Employs a two-stage selection process for efficient token identification:
+5. **Two-Phase Selection Strategy**: Employs a two-stage selection process for efficient token selection:
    - Phase 1: Identify the responsible thread (`idxt`) among the 1024 threads in a block
    - Phase 2: Select the specific token from the subset managed by thread `idxt` using the formula `int idn = idxt*4 + (t/4)*4*d + (t%4)`
    
    Therefore, this design supports maximum vocabulary sizes up to 1048576 tokens.
 
-6. **Single-Precision Optimization**: Avoids double-precision operations entirely (having only 1% of float32 throughput). For quaternary search, we utilize floating-point values reinterpreted as unsigned integers for precise calculations. Similarly, monotonic inclusive scans maintain numerical accuracy without requiring double-precision arithmetic.
+6. **No Double Precision**: Avoids double-precision operations entirely (having only 1% of float32 throughput). For quaternary search, only use floating-point values reinterpreted as unsigned integers for precise calculations. Similarly, monotonic inclusive scans maintain numerical accuracy without requiring double-precision arithmetic.
