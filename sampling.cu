@@ -1,9 +1,11 @@
 #include <iostream>
+#include <math.h>
 #include <assert.h>
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
 #include <curand_kernel.h>
+#include <stdexcept>
 typedef curandStatePhilox4_32_10_t RAND;
 
 template <typename T, typename ReduceOp>
@@ -155,6 +157,7 @@ __device__ __forceinline__ void print_bits_u32(unsigned v)
 
 __device__ __forceinline__ void dump_thread_states(const unsigned int* s_state, int nthreads)
 {
+    __syncthreads();
     if (threadIdx.x != 0) return;
 
     for (int i = 0; i < nthreads; ++i) {
@@ -178,7 +181,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     const float presence_penalty,
     const float repetition_penalty,
     const float penalty_decay,
-    const float temperature,
+    const float log2_inv_temp,
     const int   top_k,
     const float top_p
 ) {
@@ -189,10 +192,10 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     const int l = t % 32;
     // constexpr int W = (BLOCKDIM_X_SAMPLE + 31) / 32;
     __shared__ __align__(256) char reduce_buf[256];
-    assert(BLOCKDIM_X_SAMPLE == d);
-    assert(V % 4 == 0);
-    assert(V <= 1048576);
-    assert(temperature > 0.f);
+    __builtin_assume(BLOCKDIM_X_SAMPLE == d);
+    __builtin_assume(V % 4 == 0);
+    __builtin_assume(V <= 1048576);
+    __builtin_assume(log2_inv_temp > 0.f);
     const int V4 = V / 4;
     float4 l4, p4;
 
@@ -214,7 +217,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
             //     P0f(fl);
             // }
             float &fp = ((float*)&p4)[j];
-            fl = sf(sf(fl-fp) / temperature);
+            fl = sf(sf(fl-fp) * log2_inv_temp);
             maxu = max(maxu, fl);
             // ((float*)&l4)[j] = fr;
         }
@@ -233,7 +236,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
         #pragma unroll
         for (int j=0; j<4; j++){
             float &fr = ((float*)&l4)[j];
-            em += expf(fr-maxu);
+            em += exp2f(fr-maxu);
         }
         exp_denom += em;
     }
@@ -246,7 +249,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
         #pragma unroll
         for (int j=0; j<4; j++){
             float &fr = ((float*)&l4)[j];
-            fr = expf(fr-maxu) / exp_denom;
+            fr = exp2f(fr-maxu) / exp_denom;
             pmax = max(pmax, fr);
             pmin = min(pmin, fr);
             // ((float*)&l4)[j] = fr;
@@ -453,7 +456,32 @@ at::Tensor batch_sampling_repetition_temperature_topk_topp(
     V = logits.size(-1);
     B = (penalties.dim() == 2)? penalties.size(0): 1;
     T = (logits.dim() == 3)? logits.size(1): 1;
-    // std::cout << "B: " << B << ", T: " << T << " V: " << V << "\n\n";
+    if (!(V > 0 && V <= 1048576 && V % 4 == 0)){
+        throw std::invalid_argument(
+            "Vocabulary size must be multiple of 4, and no larger than 1048576, got " + std::to_string(V) 
+            + " !\n"
+        );
+    }
+    if (!(B > 0 && T > 0)){
+        throw std::invalid_argument(
+            "B and T must be positive, got B=" + std::to_string(B)
+            + ", T=" + std::to_string(T)
+            + " !\n"
+        );
+    }
+    if (!(temperature >= 0.001 && temperature <= 1000)){
+        throw std::invalid_argument(
+            "Temperature outside range, got " + std::to_string(temperature)
+            + ", expect [0.001, 1000]!\n"
+        );
+    }
+    if (top_k <= 0 || top_k > V) top_k = V;
+    if (top_p < 0 || top_p > 1)  top_p = 1;
+    if (top_p == 0) {
+        top_k = 1;
+        top_p = 1;
+    }
+    double log2e_inv_temp = M_LOG2E / temperature;
     auto stream = at::cuda::getCurrentCUDAStream();
     auto probs = at::empty({B,V}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
     if (B*V*4 <= 4194304) {
@@ -466,12 +494,7 @@ at::Tensor batch_sampling_repetition_temperature_topk_topp(
         cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
     }
     auto out = at::empty({B}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA));
-    if (top_k <= 0) top_k = V;
-    if (top_p < 0)  top_p = 1;
-    if (top_p == 0) {
-        top_k = 1;
-        top_p = 1;
-    }
+    
     batch_sampling_repetition_temperature_topk_topp_kernel<<<B, 1024, 0, stream>>>(
         B, T, V, 
         (float*)logits.data_ptr(),
@@ -482,7 +505,7 @@ at::Tensor batch_sampling_repetition_temperature_topk_topp(
         (float) presence_penalty,
         (float) repetition_penalty,
         (float) penalty_decay,
-        (float) temperature,
+        (float) log2e_inv_temp,
         (int)   top_k,
         (float) top_p
     );
@@ -497,7 +520,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
           int   *__restrict__ outputs,   // (B,)
           RAND  *__restrict__ states,    // random state, typedef curandStatePhilox4_32_10_t RAND;
           float *__restrict__ probs,     // probs (in L2 cache)
-    const float temperature,
+    const float log2e_inv_temp,
     const int   top_k,
     const float top_p
 ) {
@@ -507,10 +530,10 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
     const int w = t / 32;
     const int l = t % 32;
     __shared__ __align__(256) char reduce_buf[256];
-    assert(BLOCKDIM_X_SAMPLE == d);
-    assert(V % 4 == 0);
-    assert(V <= 1048576);
-    assert(temperature > 0.f);
+    __builtin_assume(BLOCKDIM_X_SAMPLE == d);
+    __builtin_assume(V % 4 == 0);
+    __builtin_assume(V <= 1048576);
+    __builtin_assume(log2e_inv_temp > 0.f);
     const int V4 = V / 4;
     float4 l4, p4;
 
@@ -525,7 +548,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
         #pragma unroll
         for (int j=0; j<4; j++){
             float &fl = ((float*)&l4)[j];
-            fl = sf(fl / temperature);
+            fl = sf(fl * log2e_inv_temp);
             maxu = max(maxu, fl);
         }
         ((float4*)probs)[i] = l4;
@@ -539,7 +562,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
         #pragma unroll
         for (int j=0; j<4; j++){
             float &fr = ((float*)&l4)[j];
-            em += expf(fr-maxu);
+            em += exp2f(fr-maxu);
         }
         exp_denom += em;
     }
@@ -552,7 +575,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
         #pragma unroll
         for (int j=0; j<4; j++){
             float &fr = ((float*)&l4)[j];
-            fr = expf(fr-maxu) / exp_denom;
+            fr = exp2f(fr-maxu) / exp_denom;
             pmax = max(pmax, fr);
             pmin = min(pmin, fr);
             // ((float*)&l4)[j] = fr;
@@ -571,13 +594,6 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
     l4 = {.x=1, .y=0, .z=0, .w=0};
     uint4 pivot;
     while ((cnt.x > top_k || l4.x > top_p) && left < right-1) {
-        // if(t==0){
-        //     P0i(top_k);
-        //     P0i(left);
-        //     P0i(right);
-        //     P0i(cnt.x);
-        //     printf("\n");
-        // }
         pivot.x = left;
         pivot.z = (left            + right) / 2;
         pivot.y = (left  + pivot.z        ) / 2;
@@ -752,9 +768,9 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
     const int w = t / 32;
     const int l = t % 32;
     __shared__ __align__(256) char reduce_buf[256];
-    assert(BLOCKDIM_X_SAMPLE == d);
-    assert(V % 4 == 0);
-    assert(V <= 1048576);
+    __builtin_assume(BLOCKDIM_X_SAMPLE == d);
+    __builtin_assume(V % 4 == 0);
+    __builtin_assume(V <= 1048576);
     const int V4 = V / 4;
     float4 l4, p4;
 
@@ -769,7 +785,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
         #pragma unroll
         for (int j=0; j<4; j++){
             float &fl = ((float*)&l4)[j];
-            fl = sf(fl);
+            fl = sf(fl * float(M_LOG2E));
             maxu = max(maxu, fl);
         }
         ((float4*)probs)[i] = l4;
@@ -783,7 +799,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
         #pragma unroll
         for (int j=0; j<4; j++){
             float &fr = ((float*)&l4)[j];
-            em += expf(fr-maxu);
+            em += exp2f(fr-maxu);
         }
         exp_denom += em;
     }
@@ -796,7 +812,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
         #pragma unroll
         for (int j=0; j<4; j++){
             float &fr = ((float*)&l4)[j];
-            fr = expf(fr-maxu) / exp_denom;
+            fr = exp2f(fr-maxu) / exp_denom;
             pmax = max(pmax, fr);
             pmin = min(pmin, fr);
         }
@@ -958,6 +974,34 @@ at::Tensor batch_sampling_temperature_topk_topp(
     V = logits.size(-1);
     B = (logits.dim() >= 2)? logits.size(0): 1;
     T = (logits.dim() == 3)? logits.size(1): 1;
+
+    if (!(V > 0 && V <= 1048576 && V % 4 == 0)){
+        throw std::invalid_argument(
+            "Vocabulary size must be multiple of 4, and no larger than 1048576, got " + std::to_string(V) 
+            + " !\n"
+        );
+    }
+    if (!(B > 0 && T > 0)){
+        throw std::invalid_argument(
+            "B and T must be positive, got B=" + std::to_string(B)
+            + ", T=" + std::to_string(T)
+            + " !\n"
+        );
+    }
+    if (!(temperature >= 0.001 && temperature <= 1000)){
+        throw std::invalid_argument(
+            "Temperature outside range, got " + std::to_string(temperature)
+            + ", expect [0.001, 1000]!\n"
+        );
+    }
+    if (top_k <= 0 || top_k > V) top_k = V;
+    if (top_p < 0 || top_p > 1)  top_p = 1;
+    if (top_p == 0) {
+        top_k = 1;
+        top_p = 1;
+    }
+    double log2e_inv_temp = M_LOG2E / temperature;
+
     auto stream = at::cuda::getCurrentCUDAStream();
     auto probs = at::empty({B,V}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
     if (B*V*4 <= 4194304) {
@@ -970,12 +1014,6 @@ at::Tensor batch_sampling_temperature_topk_topp(
         cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
     }
     auto out = at::empty({B}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA));
-    if (top_k <= 0) top_k = V;
-    if (top_p < 0)  top_p = 1;
-    if (top_p == 0) {
-        top_k = 1;
-        top_p = 1;
-    }
     if(temperature == 1 && top_k == V) batch_sampling_topp_kernel<<<B, 1024, 0, stream>>>(
         B, T, V, 
         (float*)logits.data_ptr(),
@@ -990,7 +1028,7 @@ at::Tensor batch_sampling_temperature_topk_topp(
         (int*)  out.data_ptr(),
         (RAND*) states.data_ptr(),
         (float*)probs.data_ptr(),
-        (float) temperature,
+        (float) log2e_inv_temp,
         (int)   top_k,
         (float) top_p
     );
