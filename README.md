@@ -3,7 +3,7 @@
 
 Fast LLM sampling kernels (1.5-25x faster than FlashInfer!) implemented in CUDA.
 
-# Warning: Prototype Quality Code, DO NOT Use in Production!
+## Update: After extensive tests, I found no more bugs (but the result is not guaranteed if input contains Inf/NaN).
 
 ## Overview
 
@@ -170,9 +170,13 @@ Within a single warp, the sequence `__shfl_up_sync 16 8 4 2 1` maintains monoton
    - 1: Shared memory reduction with schedule `512 256 ... 8 4 2 1`
    - 2: Warp-level accumulation `__shfl_up_sync 16 8 4 2 1`, followed by sequential addition of 32 values by the first thread 
 
-I implemented the second one in the code. The first approach has slightly better numerical stability, but heavier L1/shared memory burden. I am unsure which is faster.
+I implemented the second one in the code:
+- The first approach has slightly better numerical stability, but heavier L1/shared memory burden.
+- The second one is faster.
 
 The monotonicity of both methods can be proved, based on the principle that "the whole is greater than the part," and the monotonicity property of floating-point addition: if `a ≤ a'`, then `a + b ≤ a' + b`.
+
+I provide a toy example in `monotonicity.py` for you to play with.
 
 4. **L2 Cache Optimization**: Implements persistent L2 cache policies for improved memory access patterns:
    ```cpp
