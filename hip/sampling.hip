@@ -1,18 +1,20 @@
+#include "hip/hip_runtime.h"
 #include <iostream>
 #include <math.h>
 #include <assert.h>
 #include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_fp16.h>
-#include <curand_kernel.h>
+#include <ATen/hip/HIPContext.h>
+#include <hip/hip_fp16.h>
+#include <hiprand/hiprand_kernel.h>
 #include <stdexcept>
-typedef curandStatePhilox4_32_10_t RAND;
+#include <cfloat>
+typedef hiprandStatePhilox4_32_10_t RAND;
 
 template <typename T, typename ReduceOp>
 __device__ __forceinline__ void warpReduceAll(T& val, ReduceOp op) {
     #pragma unroll
     for (int offset = 16; offset>0; offset/=2) {
-        val = op(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
+        val = op(val, __shfl_xor_sync(0xFFFFFFFFFFFFFFFF, val, offset));
     }
 }
 
@@ -49,7 +51,7 @@ template <typename T>
 __device__ __forceinline__ T warpInclusiveScan(T val) {
     #pragma unroll
     for (int offset = 16; offset>0; offset/=2) {
-        T n = __shfl_up_sync(0xFFFFFFFF, val, offset);
+        T n = __shfl_up_sync(0xFFFFFFFFFFFFFFFF, val, offset);
         if (threadIdx.x % 32 >= offset) {
             val += n;
         }
@@ -113,13 +115,13 @@ struct SumOp {
 template <typename T>
 struct MaxOp {
     __device__ __forceinline__ T operator()(T a, T b) const { return max(a, b); }
-    static constexpr T identity() { return -INFINITY; }  // For float
+    static constexpr T identity() { return -FLT_MAX; }  // For float
 };
 
 template <typename T>
 struct MinOp {
     __device__ __forceinline__ T operator()(T a, T b) const { return min(a, b); }
-    static constexpr T identity() { return INFINITY; }   // For float
+    static constexpr T identity() { return FLT_MAX; }   // For float
 };
 
 template <typename T>
@@ -134,12 +136,12 @@ __device__ __forceinline__ float sf(float x){
 }
 
 __global__ void setup_rand_kernel(RAND* states, unsigned long long seed) {
-    curand_init(seed, blockIdx.x, 0, &states[blockIdx.x]);
+    hiprand_init(seed, blockIdx.x, 0, &states[blockIdx.x]);
 }
 
 at::Tensor setup_rand(int64_t seed, int64_t B){
     at::Tensor state = at::zeros({(long)(B*sizeof(RAND))}, at::TensorOptions().dtype(at::kChar).device(at::kCUDA));
-    setup_rand_kernel<<<((int)B), 1>>>((RAND*)(state.data_ptr()), (unsigned long long)seed);
+   hipLaunchKernelGGL(( setup_rand_kernel), dim3(((int)B)), dim3(1), 0, 0, (RAND*)(state.data_ptr()), (unsigned long long)seed);
     return state;
 }
 
@@ -176,7 +178,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     const float *__restrict__ logits,    // (B, V) if T == 1; If T != 1, only logits[:, T-1, :] is read. This avoids another copying operation
           float *__restrict__ penalties, // (B, V), can set some to -INF for masking
           int   *__restrict__ outputs,   // (B,)
-          RAND  *__restrict__ states,    // random state, typedef curandStatePhilox4_32_10_t RAND;
+          RAND  *__restrict__ states,    // random state, typedef hiprandStatePhilox4_32_10_t RAND;
           float *__restrict__ probs,     // probs (in L2 cache)
     const float presence_penalty,
     const float repetition_penalty,
@@ -205,7 +207,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     states    +=           b    ;  // B
     probs     += (b*T+(T-1)) * V;  // B T V
 
-    float maxu = -INFINITY;
+    float maxu = -FLT_MAX;
     for (int i=t; i<V4; i+=d) {
         l4 = ((float4*)logits)[i];
         p4 = ((float4*)penalties)[i];
@@ -238,8 +240,8 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     }
     blockReduceAll(exp_denom, SumOp<float>{}, SumOp<float>::identity(), reduce_buf);
     __syncthreads();
-    float pmax = -INFINITY;
-    float pmin = +INFINITY;
+    float pmax = -FLT_MAX;
+    float pmin = +FLT_MAX;
     for (int i=t; i<V4; i+=d) {
         l4 = ((float4*)probs)[i];
         #pragma unroll
@@ -260,8 +262,17 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     // if(t==0) P0f(pmax);
     unsigned left =  __float_as_uint(pmin), right =  __float_as_uint(pmax) + 1;
 
-    uint4 cnt = {.x=(unsigned)V, .y=0, .z=0, .w=0};
-    l4 = {.x=1, .y=0, .z=0, .w=0};
+    uint4 cnt;
+    cnt.x = (unsigned)V;
+    cnt.y = 0;
+    cnt.z = 0;
+    cnt.w = 0;
+
+    l4.x = 1;
+    l4.y = 0;
+    l4.z = 0;
+    l4.w = 0;
+
     uint4 pivot;
     while ((cnt.x > top_k || l4.x > top_p) && left < right-1) {
         // if(t==0){
@@ -380,7 +391,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     __syncthreads();
     if (t==0){
         idxt = 0;
-        rand4 = curand_uniform4(states);
+        rand4 = hiprand_uniform4(states);
         randp = sum_p * rand4.x; // only once 
     }
     __syncthreads();
@@ -389,7 +400,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     // at last thread: randp = sum_p * rand4.x < cumu_p == sum_p, u == 1
     if(l==31) ((unsigned*)reduce_buf)[w] = u;
     __syncthreads();
-    bool u_ = __shfl_up_sync(0xffffffff, u, 1);
+    bool u_ = __shfl_up_sync(0xFFFFFFFFFFFFFFFF, u, 1);
     if(t==0) u_=0;
     else if(l==0) u_ = ((unsigned*)reduce_buf)[w-1];
     __syncthreads();
@@ -412,7 +423,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     if(l==31) ((unsigned*)reduce_buf)[w] = u;
     // u: current u_: prev
     // at first thread: u_ == 0
-    u_ = __shfl_up_sync(0xffffffff, u, 1);
+    u_ = __shfl_up_sync(0xFFFFFFFFFFFFFFFF, u, 1);
     __syncthreads();
     if(t==0) u_=0;
     else if(l==0) u_ = ((unsigned*)reduce_buf)[w-1];
@@ -484,20 +495,19 @@ at::Tensor batch_sampling_repetition_temperature_topk_topp(
         top_p = 1;
     }
     double log2e_inv_temp = M_LOG2E / temperature;
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
     auto probs = at::empty({B,V}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
     if (B*V*4 <= 4194304) {
-        cudaStreamAttrValue stream_attribute;
+        hipStreamAttrValue stream_attribute;
         stream_attribute.accessPolicyWindow.base_ptr  = probs.data_ptr();
         stream_attribute.accessPolicyWindow.num_bytes = B*V*4;
         stream_attribute.accessPolicyWindow.hitRatio  = 1;
-        stream_attribute.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
-        stream_attribute.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
-        cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+        stream_attribute.accessPolicyWindow.hitProp   = hipAccessPropertyPersisting;
+        stream_attribute.accessPolicyWindow.missProp  = hipAccessPropertyStreaming;
     }
     auto out = at::empty({B}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA));
     
-    batch_sampling_repetition_temperature_topk_topp_kernel<<<B, 1024, 0, stream>>>(
+   hipLaunchKernelGGL(( batch_sampling_repetition_temperature_topk_topp_kernel), dim3(B), dim3(1024), 0, stream, 
         B, T, V, 
         (float*)logits.data_ptr(),
         (float*)penalties.data_ptr(),
@@ -520,7 +530,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
     const int V,                         // vocabulary size, 60,000 ~ 120,000
     const float *__restrict__ logits,    // (B, V) if T == 1; If T != 1, only logits[:, T-1, :] is read. This avoids another copying operation
           int   *__restrict__ outputs,   // (B,)
-          RAND  *__restrict__ states,    // random state, typedef curandStatePhilox4_32_10_t RAND;
+          RAND  *__restrict__ states,    // random state, typedef hiprandStatePhilox4_32_10_t RAND;
           float *__restrict__ probs,     // probs (in L2 cache)
     const float log2e_inv_temp,
     const int   top_k,
@@ -544,7 +554,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
     states    +=           b    ;  // B
     probs     += (b*T+(T-1)) * V;  // B T V
 
-    float maxu = -INFINITY;
+    float maxu = -FLT_MAX;
     for (int i=t; i<V4; i+=d) {
         l4 = ((float4*)logits)[i];
         #pragma unroll
@@ -570,8 +580,8 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
     }
     blockReduceAll(exp_denom, SumOp<float>{}, SumOp<float>::identity(), reduce_buf);
     __syncthreads();
-    float pmax = -INFINITY;
-    float pmin = +INFINITY;
+    float pmax = -FLT_MAX;
+    float pmin = +FLT_MAX;
     for (int i=t; i<V4; i+=d) {
         l4 = ((float4*)probs)[i];
         #pragma unroll
@@ -592,8 +602,16 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
     // if(t==0) P0f(pmax);
     unsigned left =  __float_as_uint(pmin), right =  __float_as_uint(pmax) + 1;
 
-    uint4 cnt = {.x=(unsigned)V, .y=0, .z=0, .w=0};
-    l4 = {.x=1, .y=0, .z=0, .w=0};
+    uint4 cnt;
+    cnt.x = (unsigned)V;
+    cnt.y = 0;
+    cnt.z = 0;
+    cnt.w = 0;
+
+    l4.x = 1;
+    l4.y = 0;
+    l4.z = 0;
+    l4.w = 0;
     uint4 pivot;
     while ((cnt.x > top_k || l4.x > top_p) && left < right-1) {
         pivot.x = left;
@@ -705,7 +723,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
     __syncthreads();
     if (t==0){
         idxt = 0;
-        rand4 = curand_uniform4(states);
+        rand4 = hiprand_uniform4(states);
         randp = sum_p * rand4.x; // only once 
     }
     __syncthreads();
@@ -714,7 +732,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
     // at last thread: randp = sum_p * rand4.x < cumu_p == sum_p, u == 1
     if(l==31) ((unsigned*)reduce_buf)[w] = u;
     __syncthreads();
-    bool u_ = __shfl_up_sync(0xffffffff, u, 1);
+    bool u_ = __shfl_up_sync(0xFFFFFFFFFFFFFFFF, u, 1);
     if(t==0) u_=0;
     else if(l==0) u_ = ((unsigned*)reduce_buf)[w-1];
     __syncthreads();
@@ -737,7 +755,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
     if(l==31) ((unsigned*)reduce_buf)[w] = u;
     // u: current u_: prev
     // at first thread: u_ == 0
-    u_ = __shfl_up_sync(0xffffffff, u, 1);
+    u_ = __shfl_up_sync(0xFFFFFFFFFFFFFFFF, u, 1);
     __syncthreads();
     if(t==0) u_=0;
     else if(l==0) u_ = ((unsigned*)reduce_buf)[w-1];
@@ -760,7 +778,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
     const int V,                         // vocabulary size, 60,000 ~ 120,000
     const float *__restrict__ logits,    // (B, V) if T == 1; If T != 1, only logits[:, T-1, :] is read. This avoids another copying operation
           int   *__restrict__ outputs,   // (B,)
-          RAND  *__restrict__ states,    // random state, typedef curandStatePhilox4_32_10_t RAND;
+          RAND  *__restrict__ states,    // random state, typedef hiprandStatePhilox4_32_10_t RAND;
           float *__restrict__ probs,     // probs (in L2 cache)
     const float top_p
 ) {
@@ -781,7 +799,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
     states    +=           b    ;  // B
     probs     += (b*T+(T-1)) * V;  // B T V
 
-    float maxu = -INFINITY;
+    float maxu = -FLT_MAX;
     for (int i=t; i<V4; i+=d) {
         l4 = ((float4*)logits)[i];
         #pragma unroll
@@ -807,8 +825,8 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
     }
     blockReduceAll(exp_denom, SumOp<float>{}, SumOp<float>::identity(), reduce_buf);
     __syncthreads();
-    float pmax = -INFINITY;
-    float pmin = +INFINITY;
+    float pmax = -FLT_MAX;
+    float pmin = +FLT_MAX;
     for (int i=t; i<V4; i+=d) {
         l4 = ((float4*)probs)[i];
         #pragma unroll
@@ -829,7 +847,10 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
     unsigned left =  __float_as_uint(pmin), right =  __float_as_uint(pmax) + 1;
 
     // uint4 cnt = {.x=(unsigned)V, .y=0, .z=0, .w=0};
-    l4 = {.x=1, .y=0, .z=0, .w=0};
+    l4.x = 1;
+    l4.y = 0;
+    l4.z = 0;
+    l4.w = 0;
     uint4 pivot;
     while ((l4.x > top_p) && left < right-1) {
         pivot.x = left;
@@ -917,7 +938,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
     __syncthreads();
     if (t==0){
         idxt = 0;
-        rand4 = curand_uniform4(states);
+        rand4 = hiprand_uniform4(states);
         randp = sum_p * rand4.x; // only once 
     }
     __syncthreads();
@@ -926,7 +947,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
     // at last thread: randp = sum_p * rand4.x < cumu_p == sum_p, u == 1
     if(l==31) ((unsigned*)reduce_buf)[w] = u;
     __syncthreads();
-    bool u_ = __shfl_up_sync(0xffffffff, u, 1);
+    bool u_ = __shfl_up_sync(0xFFFFFFFFFFFFFFFF, u, 1);
     if(t==0) u_=0;
     else if(l==0) u_ = ((unsigned*)reduce_buf)[w-1];
     __syncthreads();
@@ -949,7 +970,7 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
     if(l==31) ((unsigned*)reduce_buf)[w] = u;
     // u: current u_: prev
     // at first thread: u_ == 0
-    u_ = __shfl_up_sync(0xffffffff, u, 1);
+    u_ = __shfl_up_sync(0xFFFFFFFFFFFFFFFF, u, 1);
     __syncthreads();
     if(t==0) u_=0;
     else if(l==0) u_ = ((unsigned*)reduce_buf)[w-1];
@@ -1010,19 +1031,18 @@ at::Tensor batch_sampling_temperature_topk_topp(
     }
     double log2e_inv_temp = M_LOG2E / temperature;
 
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
     auto probs = at::empty({B,V}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
     if (B*V*4 <= 4194304) {
-        cudaStreamAttrValue stream_attribute;
+        hipStreamAttrValue stream_attribute;
         stream_attribute.accessPolicyWindow.base_ptr  = probs.data_ptr();
         stream_attribute.accessPolicyWindow.num_bytes = B*V*4;
         stream_attribute.accessPolicyWindow.hitRatio  = 1;
-        stream_attribute.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
-        stream_attribute.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
-        cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+        stream_attribute.accessPolicyWindow.hitProp   = hipAccessPropertyPersisting;
+        stream_attribute.accessPolicyWindow.missProp  = hipAccessPropertyStreaming;
     }
     auto out = at::empty({B}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA));
-    if(temperature == 1 && top_k == V) batch_sampling_topp_kernel<<<B, 1024, 0, stream>>>(
+    if(temperature == 1 && top_k == V)hipLaunchKernelGGL(( batch_sampling_topp_kernel), dim3(B), dim3(1024), 0, stream, 
         B, T, V, 
         (float*)logits.data_ptr(),
         (int*)  out.data_ptr(),
@@ -1030,7 +1050,7 @@ at::Tensor batch_sampling_temperature_topk_topp(
         (float*)probs.data_ptr(),
         (float) top_p
     );
-    else batch_sampling_temperature_topk_topp_kernel<<<B, 1024, 0, stream>>>(
+    else hipLaunchKernelGGL(( batch_sampling_temperature_topk_topp_kernel), dim3(B), dim3(1024), 0, stream, 
         B, T, V, 
         (float*)logits.data_ptr(),
         (int*)  out.data_ptr(),

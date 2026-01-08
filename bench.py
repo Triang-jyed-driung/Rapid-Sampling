@@ -2,13 +2,21 @@ import torch
 from torch.utils.cpp_extension import load
 import flashinfer
 torch.manual_seed(42)
-
-sample = load(
-    name="sample",
-    sources = ["sampling.cpp","sampling.cu"],
-    extra_cuda_cflags=["-O3", "-res-usage", "--extra-device-vectorization", "-Xptxas -O3"],
-    verbose=True,
-)
+ROCm_flag = torch.version.hip is not None
+if ROCm_flag:
+    sample = load(
+        name="sample",
+        sources = ["hip/sampling_op.hip","hip/sampling.hip"],
+        extra_cuda_cflags=['-fopenmp', '-ffast-math', '-O3', '-munsafe-fp-atomics'],
+        verbose=True,
+    )
+else:
+    sample = load(
+        name="sample",
+        sources = ["sampling.cpp","sampling.cu"],
+        extra_cuda_cflags=["-O3", "-res-usage", "--extra-device-vectorization", "-Xptxas -O3"],
+        verbose=True,
+    )
 
 import torch
 import flashinfer
