@@ -3,7 +3,7 @@
 
 Fast LLM sampling kernels (1.5-25x faster than FlashInfer!) implemented in CUDA.
 
-## Update: After extensive tests, I found no more bugs (but the result is not guaranteed if input contains Inf/NaN).
+## Update: After extensive tests, I found no more bugs. The code now does some input sanity check, and it also passes statistical G-tests.
 
 ## Overview
 
