@@ -5,6 +5,8 @@ from torch.utils.cpp_extension import load
 
 ROCm_flag = torch.version.hip is not None
 
+sampler_path = os.path.dirname(__file__)
+
 class Sampler:
     """
     高性能采样器类，支持温度缩放、Top-K、Top-P 采样及重复惩罚机制。
@@ -29,7 +31,7 @@ class Sampler:
 
         self.sample_module = load(
             name="sample",
-            sources=sources,
+            sources=list(map(lambda x:os.path.join(sampler_path,x),sources)),
             extra_cuda_cflags=extra_cflags,
             verbose=verbose,
         )
