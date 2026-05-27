@@ -170,6 +170,28 @@ __device__ __forceinline__ void dump_thread_states(const unsigned int* s_state, 
 }
 
 
+auto check_tensor(int B, const at::Tensor& t, const std::string& name, bool is_int = false) {
+    if (t.numel() != B) {
+        throw std::invalid_argument(
+            name + " length must match batch size. Expected " + std::to_string(B) 
+            + ", got " + std::to_string(t.numel())
+        );
+    }
+    if (!t.device().is_cuda()) {
+        throw std::invalid_argument(name + " must be on a CUDA device.");
+    }
+    if (is_int) {
+        if (t.dtype() != at::kInt) {
+            throw std::invalid_argument(name + " must be of type Int32.");
+        }
+    } else {
+        if (t.dtype() != at::kFloat) {
+            throw std::invalid_argument(name + " must be of type Float32.");
+        }
+    }
+};
+
+
 #define BLOCKDIM_X_SAMPLE 1024
 __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetition_temperature_topk_topp_kernel(
     const int B,
@@ -180,14 +202,25 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
           int   *__restrict__ outputs,   // (B,)
           RAND  *__restrict__ states,    // random state, typedef hiprandStatePhilox4_32_10_t RAND;
           float *__restrict__ probs,     // probs (in L2 cache)
-    const float presence_penalty,
-    const float repetition_penalty,
-    const float penalty_decay,
-    const float log2_inv_temp,
-    const int   top_k,
-    const float top_p
+
+    // tensor sampling parameters
+    const float* __restrict__ temperatures,
+    const int*   __restrict__ top_ks,
+    const float* __restrict__ top_ps,
+    const float* __restrict__ presence_penalties,
+    const float* __restrict__ repetition_penalties,
+    const float* __restrict__ penalty_decays,
+    const bool*  __restrict__ eos_mask
+
 ) {
     const int b = blockIdx.x;
+    
+    if (eos_mask[b]) {
+        if (threadIdx.x == 0) outputs[b] = 0; // EOS token id
+        __syncthreads();
+        return;
+    }
+
     const int d = blockDim.x;
     const int t = threadIdx.x;
     const int w = t / 32;
@@ -197,6 +230,17 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     __builtin_assume(BLOCKDIM_X_SAMPLE == d);
     __builtin_assume(V % 4 == 0);
     __builtin_assume(V <= 1048576);
+    
+    // block parameters
+    const float temperature       = temperatures[b];
+    const int   top_k             = top_ks[b];
+    const float top_p             = top_ps[b];
+    const float presence_penalty  = presence_penalties[b];
+    const float repetition_penalty= repetition_penalties[b];
+    const float penalty_decay     = penalty_decays[b];
+
+    const float log2_inv_temp = float(M_LOG2E) / temperature;
+
     __builtin_assume(log2_inv_temp > 0.f);
     const int V4 = V / 4;
     float4 l4, p4;
@@ -452,12 +496,15 @@ at::Tensor batch_sampling_repetition_temperature_topk_topp(
     at::Tensor& logits,
     at::Tensor& penalties,
     at::Tensor& states,
-    double      presence_penalty,
-    double      repetition_penalty,
-    double      penalty_decay,
-    double      temperature,
-    int64_t     top_k,
-    double      top_p
+    
+    // tensor sampling parameters
+    at::Tensor& temperatures,
+    at::Tensor& top_ks,
+    at::Tensor& top_ps,
+    at::Tensor& presence_penalties,
+    at::Tensor& repetition_penalties,
+    at::Tensor& penalty_decays,
+    at::Tensor& eos_mask
 ) {
     int B, T, V;
     if (logits.dtype() != at::kFloat) {
@@ -482,19 +529,14 @@ at::Tensor batch_sampling_repetition_temperature_topk_topp(
             + " !\n"
         );
     }
-    if (!(temperature >= 0.001 && temperature <= 1000)){
-        throw std::invalid_argument(
-            "Temperature outside range, got " + std::to_string(temperature)
-            + ", expect [0.001, 1000]!\n"
-        );
-    }
-    if (top_k <= 0 || top_k > V) top_k = V;
-    if (top_p < 0 || top_p > 1)  top_p = 1;
-    if (top_p == 0) {
-        top_k = 1;
-        top_p = 1;
-    }
-    double log2e_inv_temp = M_LOG2E / temperature;
+    
+    check_tensor(B, temperatures, "temperatures");
+    check_tensor(B, top_ks, "top_ks", true);
+    check_tensor(B, top_ps, "top_ps");
+    check_tensor(B, presence_penalties, "presence_penalties");
+    check_tensor(B, repetition_penalties, "repetition_penalties");
+    check_tensor(B, penalty_decays, "penalty_decays");
+
     auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
     auto probs = at::empty({B,V}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
     if (B*V*4 <= 4194304) {
@@ -514,12 +556,14 @@ at::Tensor batch_sampling_repetition_temperature_topk_topp(
         (int*)  out.data_ptr(),
         (RAND*) states.data_ptr(),
         (float*)probs.data_ptr(),
-        (float) presence_penalty,
-        (float) repetition_penalty,
-        (float) penalty_decay,
-        (float) log2e_inv_temp,
-        (int)   top_k,
-        (float) top_p
+
+        (float*)temperatures.data_ptr(),
+        (int*)  top_ks.data_ptr(),
+        (float*)top_ps.data_ptr(),
+        (float*)presence_penalties.data_ptr(),
+        (float*)repetition_penalties.data_ptr(),
+        (float*)penalty_decays.data_ptr(),
+        (bool*) eos_mask.data_ptr()
     );
     return out;
 }
@@ -532,11 +576,21 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
           int   *__restrict__ outputs,   // (B,)
           RAND  *__restrict__ states,    // random state, typedef hiprandStatePhilox4_32_10_t RAND;
           float *__restrict__ probs,     // probs (in L2 cache)
-    const float log2e_inv_temp,
-    const int   top_k,
-    const float top_p
+
+    // tensor sampling parameters
+    const float* __restrict__ temperatures,
+    const int*   __restrict__ top_ks,
+    const float* __restrict__ top_ps,
+    const bool*  __restrict__ eos_mask
 ) {
     const int b = blockIdx.x;
+    
+    if (eos_mask[b]) {
+        if (threadIdx.x == 0) outputs[b] = 0; // EOS token id
+        __syncthreads();
+        return;
+    }
+
     const int d = blockDim.x;
     const int t = threadIdx.x;
     const int w = t / 32;
@@ -545,6 +599,14 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
     __builtin_assume(BLOCKDIM_X_SAMPLE == d);
     __builtin_assume(V % 4 == 0);
     __builtin_assume(V <= 1048576);
+    
+    // block parameters
+    const float temperature       = temperatures[b];
+    const int   top_k             = top_ks[b];
+    const float top_p             = top_ps[b];
+
+    const float log2e_inv_temp = float(M_LOG2E) / temperature;
+
     __builtin_assume(log2e_inv_temp > 0.f);
     const int V4 = V / 4;
     float4 l4, p4;
@@ -780,9 +842,18 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
           int   *__restrict__ outputs,   // (B,)
           RAND  *__restrict__ states,    // random state, typedef hiprandStatePhilox4_32_10_t RAND;
           float *__restrict__ probs,     // probs (in L2 cache)
-    const float top_p
+
+    const float* __restrict__ top_ps,
+    const bool*  __restrict__ eos_mask
 ) {
     const int b = blockIdx.x;
+    
+    if (eos_mask[b]) {
+        if (threadIdx.x == 0) outputs[b] = 0; // EOS token id
+        __syncthreads();
+        return;
+    }
+
     const int d = blockDim.x;
     const int t = threadIdx.x;
     const int w = t / 32;
@@ -790,6 +861,9 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
     __shared__ __align__(256) char reduce_buf[256];
     __builtin_assume(BLOCKDIM_X_SAMPLE == d);
     __builtin_assume(V % 4 == 0);
+    
+    const float top_p = top_ps[b];
+
     __builtin_assume(V <= 1048576);
     const int V4 = V / 4;
     float4 l4, p4;
@@ -989,9 +1063,10 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
 at::Tensor batch_sampling_temperature_topk_topp(
     at::Tensor& logits,
     at::Tensor& states,
-    double      temperature,
-    int64_t     top_k,
-    double      top_p
+    at::Tensor& temperatures,
+    at::Tensor& top_ks,
+    at::Tensor& top_ps,
+    at::Tensor& eos_mask
 ) {
     int B, T, V;
     if (logits.dtype() != at::kFloat) {
@@ -1017,19 +1092,10 @@ at::Tensor batch_sampling_temperature_topk_topp(
             + " !\n"
         );
     }
-    if (!(temperature >= 0.001 && temperature <= 1000)){
-        throw std::invalid_argument(
-            "Temperature outside range, got " + std::to_string(temperature)
-            + ", expect [0.001, 1000]!\n"
-        );
-    }
-    if (top_k <= 0 || top_k > V) top_k = V;
-    if (top_p < 0 || top_p > 1)  top_p = 1;
-    if (top_p == 0) {
-        top_k = 1;
-        top_p = 1;
-    }
-    double log2e_inv_temp = M_LOG2E / temperature;
+    
+    check_tensor(B, temperatures, "temperatures");
+    check_tensor(B, top_ks, "top_ks", true);
+    check_tensor(B, top_ps, "top_ps");
 
     auto stream = at::hip::getCurrentHIPStreamMasqueradingAsCUDA();
     auto probs = at::empty({B,V}, at::TensorOptions().dtype(at::kFloat).device(at::kCUDA));
@@ -1042,13 +1108,22 @@ at::Tensor batch_sampling_temperature_topk_topp(
         stream_attribute.accessPolicyWindow.missProp  = hipAccessPropertyStreaming;
     }
     auto out = at::empty({B}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA));
-    if(temperature == 1 && top_k == V)hipLaunchKernelGGL(( batch_sampling_topp_kernel), dim3(B), dim3(1024), 0, stream, 
+    
+    float t_min = temperatures.min().item<float>();
+    float t_max = temperatures.max().item<float>();
+    int k_min = top_ks.min().item<int>();
+    int k_max = top_ks.max().item<int>();
+
+    if (
+        t_min == 1.0f && t_max == 1.0f && k_min == V && k_max == V
+    )hipLaunchKernelGGL(( batch_sampling_topp_kernel), dim3(B), dim3(1024), 0, stream, 
         B, T, V, 
         (float*)logits.data_ptr(),
         (int*)  out.data_ptr(),
         (RAND*) states.data_ptr(),
         (float*)probs.data_ptr(),
-        (float) top_p
+        (float*)top_ps.data_ptr(),
+        (bool*) eos_mask.data_ptr()
     );
     else hipLaunchKernelGGL(( batch_sampling_temperature_topk_topp_kernel), dim3(B), dim3(1024), 0, stream, 
         B, T, V, 
@@ -1056,9 +1131,10 @@ at::Tensor batch_sampling_temperature_topk_topp(
         (int*)  out.data_ptr(),
         (RAND*) states.data_ptr(),
         (float*)probs.data_ptr(),
-        (float) log2e_inv_temp,
-        (int)   top_k,
-        (float) top_p
+        (float*)temperatures.data_ptr(),
+        (int*)  top_ks.data_ptr(),
+        (float*)top_ps.data_ptr(),
+        (bool*) eos_mask.data_ptr()
     );
     return out;
 }
