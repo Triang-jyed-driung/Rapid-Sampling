@@ -1,0 +1,39 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Package builds and metadata
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+*.whl
+*.tar.gz
+
+# Native/CUDA build and profiling artifacts
+*.o
+*.obj
+*.so
+*.a
+*.dll
+*.dylib
+*.cubin
+*.fatbin
+*.ptx
+*.sass
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+
+# Local datasets and run logs
+*.pt
+*.pth
+*.bin
+*.log
+
+# Keep benchmark reports (timings.md) for upload.
+timings.json

@@ -1,37 +1,30 @@
+"""Run after pip install: python production/example.py."""
 import torch
-from torch.utils.cpp_extension import load
+import rapid_sampling as sampler
 
-ROCm_flag = torch.version.hip is not None
-if ROCm_flag:
-    sample = load(
-        name="sample",
-        sources = ["hip/sampling_op.hip","hip/sampling.hip"],
-        extra_cuda_cflags=['-fopenmp', '-ffast-math', '-O3', '-munsafe-fp-atomics'],
-        verbose=True,
-    )
-else:
-    sample = load(
-        name="sample",
-        sources = ["sampling.cpp","sampling.cu"],
-        extra_cuda_cflags=["-O3", "-res-usage", "--extra-device-vectorization", "-Xptxas -O3"],
-        verbose=True,
-    )
 
-batch_size = 4
-vocab_size = 131072
-temperature = 1.0
-top_p = 0.5
-top_k = -1
-presence_penalty = 1.0
-repetition_penalty = 0.1
-penalty_decay = 0.996
-states = sample.setup_rand(0, batch_size)
-logits = torch.rand(batch_size, vocab_size).to(0)
-penalties = torch.zeros(batch_size, vocab_size).to(0)
-print(logits)
-print(logits.shape)
-samples = sample.batch_sampling_temperature_topk_topp(logits, states, temperature, top_k, top_p)
-# samples = sample.batch_sampling_repetition_temperature_topk_topp(logits, penalties, states,
-#                                                                  presence_penalty, repetition_penalty, penalty_decay,
-#                                                                  temperature, top_k, top_p)
-print(samples)
+def main():
+    torch.manual_seed(42)
+    # For (B,T,V), only logits[:, -1, :] is sampled; scratch storage is (B,V).
+    logits = torch.randn(1, 1, 65536, device="cuda", dtype=torch.float32)
+    states = sampler.create_rng(seed=123, B=1)
+    for _ in range(3):
+        token = sampler.sample(
+            logits, states, temperature=1., top_k=-1, top_p=.9,
+            quantization_bits=32, histogram_bits=[10, 10, 11], block_size=1024,
+        )
+        print("uint32 sample:", token.item())
+    token = sampler.sample(
+        logits, states, temperature=1., top_k=-1, top_p=1., quantization_bits=64,
+    )
+    print("int64 sample:", token.item())
+    penalties = torch.zeros((1, 65536), device="cuda")
+    token = sampler.sample_with_penalties(
+        logits, penalties, states, presence_penalty=.75, repetition_penalty=.25,
+        penalty_decay=.5, temperature=1., top_k=50, top_p=.9,
+    )
+    print("sample with updated penalties:", token.item())
+
+
+if __name__ == "__main__":
+    main()
